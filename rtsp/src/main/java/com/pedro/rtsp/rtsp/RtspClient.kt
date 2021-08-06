@@ -5,6 +5,8 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
+import com.pedro.rtsp.rtsp.commands.CommandsManager
+import com.pedro.rtsp.rtsp.commands.Method
 import com.pedro.rtsp.utils.ConnectCheckerRtsp
 import com.pedro.rtsp.utils.CreateSSLSocket.createSSlSocket
 import com.pedro.rtsp.utils.RtpConstants
@@ -20,7 +22,7 @@ import java.util.regex.Pattern
 /**
  * Created by pedro on 10/02/17.
  */
-class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
+open class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
 
   private val TAG = "RtspClient"
 
@@ -39,7 +41,7 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
   private var tlsEnabled = false
   private val rtspSender: RtspSender = RtspSender(connectCheckerRtsp)
   private var url: String? = null
-  private val commandsManager: CommandsManager = CommandsManager(connectCheckerRtsp)
+  private val commandsManager: CommandsManager = CommandsManager()
   private var doingRetry = false
   private var numRetry = 0
   private var reTries = 0
@@ -91,18 +93,14 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
     return validReason && reTries > 0
   }
 
-  fun setSampleRate(sampleRate: Int) {
-    commandsManager.sampleRate = sampleRate
-  }
-
-  fun setSPSandPPS(sps: ByteBuffer?, pps: ByteBuffer?, vps: ByteBuffer?) {
+  fun setVideoInfo(sps: ByteBuffer?, pps: ByteBuffer?, vps: ByteBuffer?) {
     Log.i(TAG, "send sps and pps")
     commandsManager.setVideoInfo(sps, pps, vps)
     semaphore.release()
   }
 
-  fun setIsStereo(isStereo: Boolean) {
-    commandsManager.isStereo = isStereo
+  fun setAudioInfo(sampleRate: Int, isStereo: Boolean) {
+    commandsManager.setAudioInfo(sampleRate, isStereo)
   }
 
   @JvmOverloads
@@ -115,6 +113,7 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
     }
     if (!isStreaming || isRetry) {
       this.url = url
+      connectCheckerRtsp.onConnectionStartedRtsp(url)
       val rtspMatcher = rtspUrlPattern.matcher(url)
       if (rtspMatcher.matches()) {
         tlsEnabled = (rtspMatcher.group(0) ?: "").startsWith("rtsps")
@@ -137,15 +136,15 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
           try {
             commandsManager.setUrl(host, port, path)
             rtspSender.setSocketsInfo(commandsManager.protocol,
-                commandsManager.videoClientPorts, commandsManager.audioClientPorts)
+              commandsManager.videoClientPorts, commandsManager.audioClientPorts)
             rtspSender.setAudioInfo(commandsManager.sampleRate)
             if (!commandsManager.isOnlyAudio) {
-              if (commandsManager.sps == null && commandsManager.pps == null) {
+              if (commandsManager.sps == null || commandsManager.pps == null) {
                 semaphore.drainPermits()
                 Log.i(TAG, "waiting for sps and pps")
                 semaphore.tryAcquire(5000, TimeUnit.MILLISECONDS)
               }
-              if (commandsManager.sps == null && commandsManager.pps == null) {
+              if (commandsManager.sps == null || commandsManager.pps == null) {
                 connectCheckerRtsp.onConnectionFailedRtsp("sps or pps is null")
                 return@post
               } else {
@@ -166,12 +165,12 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
             writer = BufferedWriter(OutputStreamWriter(outputStream))
             writer?.write(commandsManager.createOptions())
             writer?.flush()
-            commandsManager.getResponse(reader, isAudio = false, checkStatus = false)
+            commandsManager.getResponse(reader, Method.OPTIONS)
             writer?.write(commandsManager.createAnnounce())
             writer?.flush()
             //check if you need credential for stream, if you need try connect with credential
-            val response = commandsManager.getResponse(reader, isAudio = false, checkStatus = false)
-            when (commandsManager.getResponseStatus(response)) {
+            val announceResponse = commandsManager.getResponse(reader, Method.ANNOUNCE)
+            when (announceResponse.status) {
               403 -> {
                 connectCheckerRtsp.onConnectionFailedRtsp("Error configure stream, access denied")
                 Log.e(TAG, "Response 403, access denied")
@@ -182,10 +181,9 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
                   connectCheckerRtsp.onAuthErrorRtsp()
                   return@post
                 } else {
-                  writer?.write(commandsManager.createAnnounceWithAuth(response))
+                  writer?.write(commandsManager.createAnnounceWithAuth(announceResponse.text))
                   writer?.flush()
-                  val authResponse = commandsManager.getResponse(reader, isAudio = false, checkStatus = false)
-                  when (commandsManager.getResponseStatus(authResponse)) {
+                  when (commandsManager.getResponse(reader, Method.ANNOUNCE).status) {
                     401 -> {
                       connectCheckerRtsp.onAuthErrorRtsp()
                       return@post
@@ -211,14 +209,26 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
             if (!commandsManager.isOnlyAudio) {
               writer?.write(commandsManager.createSetup(RtpConstants.trackVideo))
               writer?.flush()
-              commandsManager.getResponse(reader, isAudio = false, checkStatus = true)
+              val setupVideoStatus = commandsManager.getResponse(reader, Method.SETUP).status
+              if (setupVideoStatus != 200) {
+                connectCheckerRtsp.onConnectionFailedRtsp("Error configure stream, setup video $setupVideoStatus")
+                return@post
+              }
             }
             writer?.write(commandsManager.createSetup(RtpConstants.trackAudio))
             writer?.flush()
-            commandsManager.getResponse(reader, isAudio = true, checkStatus = true)
+            val setupAudioStatus = commandsManager.getResponse(reader, Method.SETUP).status
+            if (setupAudioStatus != 200) {
+              connectCheckerRtsp.onConnectionFailedRtsp("Error configure stream, setup audio $setupAudioStatus")
+              return@post
+            }
             writer?.write(commandsManager.createRecord())
             writer?.flush()
-            commandsManager.getResponse(reader, isAudio = false, checkStatus = true)
+            val recordStatus = commandsManager.getResponse(reader, Method.RECORD).status
+            if (recordStatus != 200) {
+              connectCheckerRtsp.onConnectionFailedRtsp("Error configure stream, record $recordStatus")
+              return@post
+            }
             outputStream?.let { out ->
               rtspSender.setDataStream(out, host)
             }
@@ -231,6 +241,7 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
             rtspSender.start()
             reTries = numRetry
             connectCheckerRtsp.onConnectionSuccessRtsp()
+            handleServerCommands()
           } catch (e: Exception) {
             Log.e(TAG, "connection error", e)
             connectCheckerRtsp.onConnectionFailedRtsp("Error configure stream, " + e.message)
@@ -238,6 +249,23 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
           }
         }
       }
+    }
+  }
+
+  private fun handleServerCommands() {
+    //Read and print server commands received each 2 seconds
+    while (!Thread.interrupted()) {
+      try {
+        Thread.sleep(2000)
+        reader?.let { r ->
+          if (r.ready()) {
+            val command = commandsManager.getResponse(r)
+            //Do something depend of command if required
+          }
+        }
+      } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+      } catch (e:Exception) { }
     }
   }
 
@@ -269,6 +297,9 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
             commandsManager.retryClear()
           }
           connectionSocket?.close()
+          reader?.close()
+          reader = null
+          writer?.close()
           writer = null
           connectionSocket = null
           Log.i(TAG, "write teardown success")
@@ -279,6 +310,9 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
             commandsManager.retryClear()
           }
           Log.e(TAG, "disconnect error", e)
+        } finally {
+          thread?.looper?.quit()
+          return@post
         }
       }
     }
@@ -287,8 +321,6 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
       thread?.looper?.thread?.interrupt()
       thread?.looper?.quit()
       thread?.quit()
-      writer?.flush()
-      thread?.join(100)
       thread = null
       semaphore.release()
     } catch (e: Exception) { }
@@ -314,12 +346,13 @@ class RtspClient(private val connectCheckerRtsp: ConnectCheckerRtsp) {
     return rtspSender.hasCongestion()
   }
 
-  fun reConnect(delay: Long) {
+  @JvmOverloads
+  fun reConnect(delay: Long, backupUrl: String? = null) {
     reTries--
     disconnect(false)
     runnable = Runnable {
-      Log.e("Pedro", "connect")
-      connect(url, true)
+      val reconnectUrl = backupUrl ?: url
+      connect(reconnectUrl, true)
     }
     runnable?.let { handler.postDelayed(it, delay) }
   }
